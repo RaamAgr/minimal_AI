@@ -1,38 +1,74 @@
 // src/store.js
-const REMOTE_URL = process.env.REMOTE_STORE_URL; // e.g. https://my-json-store.com/data/chatgpt-session
-const API_KEY = process.env.REMOTE_STORE_KEY;    // A secret key to protect your data
+import axios from 'axios';
+
+// FORCE AXIOS TO NOT CRASH ON 404
+axios.defaults.validateStatus = function (status) {
+    return status < 500; 
+};
 
 export const Store = {
     async load() {
-        if (!REMOTE_URL) return null;
         try {
-            const res = await fetch(REMOTE_URL, { 
-                headers: { 'X-Auth-Key': API_KEY } 
+            const url = process.env.REMOTE_STORE_URL;
+            const key = process.env.REMOTE_STORE_KEY;
+
+            if (!url || !key) {
+                console.error('[Store] Missing Environment Variables!');
+                return null;
+            }
+
+            console.log('[Store] Fetching session from cloud...');
+            const response = await axios.get(url, {
+                headers: {
+                    'X-Master-Key': key,
+                    'X-Bin-Meta': 'false' // <--- CRITICAL FIX: Tells JSONBin to give raw data
+                }
             });
-            if (!res.ok) return null;
-            const json = await res.json();
-            // Handle if the data is nested or direct
-            return json.data ? JSON.parse(json.data) : json;
-        } catch (e) {
-            console.error('[Store] Load failed:', e.message);
+
+            if (response.status !== 200) {
+                console.error(`[Store] Fetch failed: ${response.status} - ${response.statusText}`);
+                return null;
+            }
+
+            // EXTRACT DATA SAFELY
+            let data = response.data;
+            
+            // If JSONBin still wraps it in "record", unwrap it
+            if (data && data.record) {
+                data = data.record;
+            }
+
+            if (!data || !data.cookies) {
+                console.error('[Store] Downloaded data is empty or missing cookies.');
+                return null;
+            }
+
+            console.log(`[Store] Success! Found ${data.cookies.length} cookies.`);
+            return data;
+
+        } catch (error) {
+            console.error('[Store] Load Error:', error.message);
             return null;
         }
     },
 
     async save(data) {
-        if (!REMOTE_URL) return;
         try {
-            await fetch(REMOTE_URL, {
-                method: 'POST',
-                headers: { 
+            const url = process.env.REMOTE_STORE_URL;
+            const key = process.env.REMOTE_STORE_KEY;
+
+            if (!url || !key) return;
+
+            // JSONBin requires PUT to update existing bin
+            await axios.put(url, data, {
+                headers: {
                     'Content-Type': 'application/json',
-                    'X-Auth-Key': API_KEY 
-                },
-                body: JSON.stringify({ data: JSON.stringify(data) })
+                    'X-Master-Key': key
+                }
             });
             console.log('[Store] Session synced to cloud.');
-        } catch (e) {
-            console.error('[Store] Save failed:', e.message);
+        } catch (error) {
+            console.error('[Store] Save Error:', error.message);
         }
     }
 };

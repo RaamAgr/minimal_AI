@@ -1,4 +1,3 @@
-// src/browser.js
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { Store } from './store.js';
@@ -8,131 +7,187 @@ puppeteer.use(StealthPlugin());
 let browser = null;
 let page = null;
 let requestCount = 0;
-const MAX_REQUESTS = 20; // Restart after 20 prompts to clear RAM
 
-const CHATGPT_URL = 'https://chatgpt.com/?temporary-chat=true'; // Force temp chat
+// --- SMART CACHING SYSTEM ---
+let cachedSession = null; 
+let lastCloudUpdate = 0;
+const CLOUD_UPDATE_INTERVAL = 6 * 60 * 60 * 1000; // 6 Hours
+
+const MAX_REQUESTS = 20;
+const TIMEOUT_MS = 60000; 
+const MAX_RETRIES = 5;
+const CHATGPT_URL = 'https://chatgpt.com/?temporary-chat=true'; 
+const isMac = process.platform === 'darwin';
 
 export const Browser = {
-    // Check if ready
     isReady: () => !!page && !page.isClosed(),
 
-    // Initialize (Start or Restart)
     async init() {
         if (browser) await Browser.close();
 
-        console.log('[Browser] Launching...');
-        browser = await puppeteer.launch({
-            headless: 'new',
-            args: [
-                '--no-sandbox', '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage', // Critical for Docker
-                '--disable-gpu',
-                '--no-first-run',
-                '--no-zygote',
-                '--single-process' // Minimal RAM usage
-            ]
-        });
-
-        page = await browser.newPage();
+        console.log(`[Browser] Launching in ${isMac ? 'MAC (Ghost)' : 'SERVER'} mode...`);
         
-        // 1. RAM SAVER: Block heavy resources
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            const type = req.resourceType();
-            if (['image', 'stylesheet', 'font', 'media', 'other'].includes(type)) req.abort();
-            else req.continue();
-        });
+        const launchOptions = {
+            headless: true, // Ghost Mode
+            defaultViewport: { width: 1280, height: 800 },
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+        };
 
-        // 2. Load Session
-        const session = await Store.load();
-        if (session && session.cookies) {
-            console.log(`[Browser] Restoring ${session.cookies.length} cookies...`);
-            await page.setCookie(...session.cookies);
+        if (isMac) {
+            launchOptions.executablePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+        } else {
+            launchOptions.args.push('--single-process', '--no-zygote', '--disable-gpu');
         }
 
-        // 3. Go to ChatGPT
-        console.log('[Browser] Navigating to ChatGPT...');
+        browser = await puppeteer.launch(launchOptions);
+        page = await browser.newPage();
+
+        // 1. SMART LOAD: Only hit Cloud if RAM is empty
+        if (!cachedSession) {
+            console.log('[Browser] Fetching session from Cloud...');
+            cachedSession = await Store.load();
+            lastCloudUpdate = Date.now(); // Reset timer on load
+        } else {
+            console.log('[Browser] Using Cached Session (RAM).');
+        }
+
+        // 2. Apply Identity
+        if (cachedSession) {
+            if (cachedSession.userAgent) await page.setUserAgent(cachedSession.userAgent);
+            
+            if (cachedSession.cookies) {
+                console.log(`[Browser] Restoring ${cachedSession.cookies.length} cookies...`);
+                await page.setCookie(...cachedSession.cookies);
+            }
+        }
+
+        // 3. Navigate
+        console.log('[Browser] Initializing ChatGPT...');
         try {
             await page.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
         } catch (e) {
-            console.error('[Browser] Navigation timeout (continuing anyway)');
+            console.log('[Browser] Navigation timeout (continuing)...');
         }
 
-        // 4. Verify Login
-        const loggedIn = await page.$('#prompt-textarea');
-        if (!loggedIn) {
-            console.error('[Browser] CRITICAL: Not logged in. Run "npm run login" locally first.');
-            throw new Error('Login Required');
+        // 4. Inject Storage
+        if (cachedSession && cachedSession.localStorage) {
+            console.log('[Browser] Injecting LocalStorage...');
+            await page.evaluate((data) => {
+                const ls = JSON.parse(data);
+                localStorage.clear();
+                for (const key in ls) localStorage.setItem(key, ls[key]);
+            }, cachedSession.localStorage);
+            await page.reload({ waitUntil: 'domcontentloaded' });
         }
-
-        console.log('[Browser] Ready!');
     },
 
-    // Ask Question
     async ask(prompt) {
         requestCount++;
         if (requestCount > MAX_REQUESTS) {
-            console.log('[Browser] Maintenance restart...');
             requestCount = 0;
             await Browser.init();
         }
 
-        if (!page) await Browser.init();
+        if (!page || page.isClosed()) await Browser.init();
 
-        // Type prompt
-        const inputSelector = '#prompt-textarea';
-        await page.waitForSelector(inputSelector);
-        await page.focus(inputSelector);
-        await page.keyboard.type(prompt, { delay: 10 }); // Human jitter
-        await page.keyboard.press('Enter');
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                console.log(`[Browser] Request Attempt ${attempt}/${MAX_RETRIES}...`);
 
-        // Wait for response (Stability check)
-        return await waitForStability();
+                // Force Refresh (Clean State)
+                await page.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+
+                const performAsk = async () => {
+                    const inputSelector = '#prompt-textarea';
+                    try {
+                        await page.waitForSelector(inputSelector, { timeout: 20000 });
+                    } catch(e) {
+                        throw new Error("Input box not found (Possible Login Issue)");
+                    }
+                    
+                    await new Promise(r => setTimeout(r, 1500));
+                    
+                    await page.focus(inputSelector);
+                    await page.keyboard.type(prompt, { delay: 10 });
+                    await page.keyboard.press('Enter');
+
+                    return await waitForStability();
+                };
+
+                return await Promise.race([
+                    performAsk(),
+                    new Promise((_, r) => setTimeout(() => r(new Error('TIMEOUT')), TIMEOUT_MS))
+                ]);
+
+            } catch (err) {
+                console.error(`[Browser] Error: ${err.message}`);
+                if (attempt === MAX_RETRIES) throw err;
+                await Browser.init();
+            }
+        }
     },
 
-    // Close
     async close() {
         if (browser) await browser.close();
-        browser = null;
-        page = null;
+        browser = null; page = null;
     }
 };
 
-// Helper: Wait until text stops moving
+// --- HELPER FUNCTIONS ---
+
 async function waitForStability() {
     const bubbleSelector = 'div[data-message-author-role="assistant"]';
+    await page.waitForSelector(bubbleSelector, { timeout: 15000 });
+    
     let lastText = '';
     let stableCount = 0;
-    
-    // Wait for first bubble
-    try { await page.waitForSelector(bubbleSelector, { timeout: 10000 }); } catch (e) { return "Error: No response started."; }
 
-    // Poll every 500ms
-    for (let i = 0; i < 200; i++) { // Max 100 seconds
+    for (let i = 0; i < 200; i++) {
         const currentText = await page.evaluate((sel) => {
             const els = document.querySelectorAll(sel);
             return els.length ? els[els.length - 1].innerText : '';
         }, bubbleSelector);
 
-        if (currentText && currentText === lastText && currentText !== 'Thinking...') {
+        if (currentText && currentText === lastText && !currentText.includes('Thinking')) {
             stableCount++;
-            if (stableCount > 3) { // Stable for 1.5s
-                // Save session in background to keep it fresh
-                saveSessionInBackground(); 
+            if (stableCount > 4) {
+                // SMART SAVE TRIGGER
+                checkAndSaveSession();
                 return currentText;
             }
         } else {
             stableCount = 0;
         }
+        
         lastText = currentText;
         await new Promise(r => setTimeout(r, 500));
     }
     return lastText;
 }
 
-async function saveSessionInBackground() {
-    try {
-        const cookies = await page.cookies();
-        await Store.save({ cookies, updatedAt: Date.now() });
-    } catch (e) {}
+// --- INTELLIGENT SAVER ---
+async function checkAndSaveSession() {
+    const now = Date.now();
+    const timeSinceLastSave = now - lastCloudUpdate;
+
+    // Only save if 6 hours (in ms) have passed
+    if (timeSinceLastSave > CLOUD_UPDATE_INTERVAL) {
+        console.log(`[Browser] 6 Hours passed. Syncing fresh session to Cloud...`);
+        try {
+            const cookies = await page.cookies();
+            
+            // Update RAM Cache first
+            if (cachedSession) {
+                cachedSession.cookies = cookies;
+                cachedSession.updatedAt = now;
+            }
+
+            // Upload to Cloud
+            await Store.save(cachedSession);
+            lastCloudUpdate = now; // Reset timer
+            console.log('[Browser] Cloud Sync Complete.');
+        } catch (e) {
+            console.error('[Browser] Background Sync Failed (Will retry next request).');
+        }
+    }
 }
