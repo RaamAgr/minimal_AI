@@ -1,3 +1,4 @@
+// src/browser.js
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { Store } from './store.js';
@@ -8,7 +9,7 @@ let browser = null;
 let page = null;
 let requestCount = 0;
 
-// --- SMART CACHING SYSTEM ---
+// --- SMART CACHING SYSTEM (Saves $ and Quota) ---
 let cachedSession = null; 
 let lastCloudUpdate = 0;
 const CLOUD_UPDATE_INTERVAL = 6 * 60 * 60 * 1000; // 6 Hours
@@ -25,19 +26,27 @@ export const Browser = {
     async init() {
         if (browser) await Browser.close();
 
-        console.log(`[Browser] Launching in ${isMac ? 'MAC (Ghost)' : 'SERVER'} mode...`);
+        console.log(`[Browser] Launching in ${isMac ? 'MAC (Ghost)' : 'RENDER/LINUX'} mode...`);
         
+        // --- RENDER-SAFE LAUNCH OPTIONS ---
         const launchOptions = {
-            headless: true, // Ghost Mode
+            headless: true, // Always hidden
             defaultViewport: { width: 1280, height: 800 },
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            args: [
+                '--no-sandbox', 
+                '--disable-setuid-sandbox', 
+                '--disable-dev-shm-usage', // Critical for Render Memory
+                '--disable-gpu',
+                '--no-first-run',
+                '--no-zygote'
+            ]
         };
 
+        // On Mac, force it to use your installed Chrome
         if (isMac) {
             launchOptions.executablePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-        } else {
-            launchOptions.args.push('--single-process', '--no-zygote', '--disable-gpu');
-        }
+        } 
+        // On Render, do NOTHING. It will automatically use the Chromium installed via 'npm run build'
 
         browser = await puppeteer.launch(launchOptions);
         page = await browser.newPage();
@@ -46,7 +55,7 @@ export const Browser = {
         if (!cachedSession) {
             console.log('[Browser] Fetching session from Cloud...');
             cachedSession = await Store.load();
-            lastCloudUpdate = Date.now(); // Reset timer on load
+            lastCloudUpdate = Date.now(); 
         } else {
             console.log('[Browser] Using Cached Session (RAM).');
         }
@@ -57,7 +66,15 @@ export const Browser = {
             
             if (cachedSession.cookies) {
                 console.log(`[Browser] Restoring ${cachedSession.cookies.length} cookies...`);
-                await page.setCookie(...cachedSession.cookies);
+                
+                // --- CRITICAL FIX: SANITIZE COOKIES ---
+                // Removes 'partitionKey' to prevent "Protocol Error" on Render
+                const sanitizedCookies = cachedSession.cookies.map(cookie => {
+                    const { partitionKey, sameParty, ...rest } = cookie;
+                    return rest;
+                });
+
+                await page.setCookie(...sanitizedCookies);
             }
         }
 
@@ -170,7 +187,7 @@ async function checkAndSaveSession() {
     const now = Date.now();
     const timeSinceLastSave = now - lastCloudUpdate;
 
-    // Only save if 6 hours (in ms) have passed
+    // Only save if 6 hours have passed
     if (timeSinceLastSave > CLOUD_UPDATE_INTERVAL) {
         console.log(`[Browser] 6 Hours passed. Syncing fresh session to Cloud...`);
         try {
@@ -182,12 +199,11 @@ async function checkAndSaveSession() {
                 cachedSession.updatedAt = now;
             }
 
-            // Upload to Cloud
             await Store.save(cachedSession);
-            lastCloudUpdate = now; // Reset timer
+            lastCloudUpdate = now;
             console.log('[Browser] Cloud Sync Complete.');
         } catch (e) {
-            console.error('[Browser] Background Sync Failed (Will retry next request).');
+            console.error('[Browser] Background Sync Failed.');
         }
     }
 }
